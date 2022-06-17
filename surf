@@ -186,17 +186,17 @@ class Surf:
     def sync_with_remote(self):
         self.log("syncing with remote...")
         os.system(
-            "rclone sync {} {}".format(
-                self.rclone_remote_dir, self.rclone_local_dir
+            "rclone sync {remote} {local}; rsync -r {local}/* {target}".format(
+                remote=self.rclone_remote_dir,
+                local=self.rclone_local_dir,
+                target=self.target_dir,
             )
         )
 
     def save_new_checkfile(self):
         self.log("saving new checkfile...")
         os.system(
-            "rclone md5sum {} > {}".format(
-                self.rclone_remote_dir, CHECKFILE
-            )
+            "rclone md5sum {} > {}".format(self.rclone_remote_dir, CHECKFILE)
         )
 
     def create_button_html(self, path: str) -> str:
