@@ -194,7 +194,7 @@ class Surf:
     def save_new_checkfile(self):
         self.log("saving new checkfile...")
         os.system(
-            "rclone md5sum {} --output-file {}".format(
+            "rclone md5sum {} > {}".format(
                 self.rclone_remote_dir, CHECKFILE
             )
         )
@@ -280,7 +280,7 @@ class Surf:
                         html += self.handle_last_stage_html(file_path)
                     elif depth == 1:
                         html += self.create_heading_html(filename)
-                        for subdir_path in get_subdirs(file_path):
+                        for subdir_path in sorted(get_subdirs(file_path)):
                             html += self.handle_last_stage_html(subdir_path)
                         if self.contains_files(file_path):
                             self.error_msg(
