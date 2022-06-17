@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import re
+import datetime
+import ssl
+import smtplib
+from email.mime.text import MIMEText
+
+from configparser import ConfigParser
+from termcolor import colored
+import colorama
+
+CHECKFILE = "/tmp/surfcheckfile"
+CACHEFILE = "/tmp/surfcachefile"
+LOGFILE = "/tmp/surflogfile"
+
+
+def is_nested_directory(path: str) -> bool:
+    for filename in os.listdir(path):
+        file_path = os.path.join(path, filename)
+        if os.path.isdir(file_path):
+            return True
+
+    return False
+
+
+def get_subdirs(path: str) -> list:
+    subdirs = []
+    for filename in os.listdir(path):
+        file_path = os.path.join(path, filename)
+        if os.path.isdir(file_path):
+            subdirs.append(file_path)
+
+    return subdirs
+
+
+def directory_depth(path: str) -> int:
+    if is_nested_directory(path):
+        return 1 + max(directory_depth(subdir) for subdir in get_subdirs(path))
+
+    return 0
+
+
+def remove_index_from_filename(filename: str) -> str:
+    return filename[filename.find(" ") + 1 :]
+
+
+class Surf:
+    def __init__(self):
+        self.full_run_log = ""
+        self.rclone_remote_dir = ""
+        self.rclone_local_dir = ""
+        self.sending_server = ""
+        self.sending_username = ""
+        self.sending_password = ""
+        self.sending_port = 587
+        self.reveiving_addresses = []
+        self.target_dir = ""
+        self.target_repo = ""
+        self.template = ""
+        self.target_file = ""
+        self.parse_config()
+
+    def parse_config(self):
+        config_parser = ConfigParser()
+        config_parser.read("config.ini")
+        self.full_run_log = ""
+        try:
+            self.rclone_remote_dir = config_parser["RCLONE"]["remote_dir"]
+            self.rclone_local_dir = config_parser["RCLONE"]["local_dir"]
+            self.sending_server = config_parser["SENDING"]["server"]
+            self.sending_username = config_parser["SENDING"]["username"]
+            self.sending_password = config_parser["SENDING"]["password"]
+            self.sending_port = int(config_parser["SENDING"]["port"])
+            self.reveiving_addresses = str(
+                config_parser["RECEIVING"]["addresses"]
+            ).split(",")
+            self.strip_email_whitespace()
+            self.target_dir = config_parser["TARGET"]["dir"]
+            self.target_repo = config_parser["TARGET"]["git_repo"]
+            self.template = config_parser["TARGET"]["template"]
+            self.target_file = config_parser["TARGET"]["file"]
+        except (KeyError, ValueError):
+            self.error_msg(
+                "configuration file 'config.ini' could not be parsed"
+            )
+
+        self.log("configuration initialised")
+
+    def strip_email_whitespace(self):
+        stripped_addresses = []
+        for address in self.reveiving_addresses:
+            stripped_addresses.append(address.strip())
+        self.reveiving_addresses = stripped_addresses
+
+    def send_error_log_emails(self):
+        self.log("sending error logs via email...")
+        context = ssl.create_default_context()
+
+        mime_msg = MIMEText(self.full_run_log, "plain", "utf-8")
+        mime_msg["Subject"] = "[surf] error message log"
+        mime_msg["From"] = self.sending_username
+        mime_msg["To"] = ", ".join(self.reveiving_addresses)
+
+        with smtplib.SMTP(self.sending_server, self.sending_port) as connection:
+            connection.starttls(context=context)
+            connection.login(self.sending_username, self.sending_password)
+            connection.sendmail(
+                self.sending_username,
+                self.reveiving_addresses,
+                mime_msg.as_string(),
+            )
+        self.log("email sent")
+
+    def error_msg(self, message: str):
+        self.log(message=message, color="red", pre="Error: ")
+        self.send_error_log_emails()
+        sys.exit(1)
+
+    def log(self, message: str, color: str = "green", pre: str = ""):
+        log_text = "[{}]{} {}".format(datetime.datetime.now(), pre, message)
+
+        newlined_log_text = "{}\n".format(log_text)
+        self.full_run_log += newlined_log_text
+
+        with open(LOGFILE, mode="+a", encoding="utf-8") as log_appender:
+            log_appender.write(newlined_log_text)
+        print(colored(log_text, color))
+
+    def exit_early(self):
+        self.log("no remote changes found, exiting...")
+        sys.exit(0)
+
+    def success_message(self):
+        self.log("nothing else to do, exiting...")
+        sys.exit(0)
+
+    def no_changes_detected(self):
+        if not self.checksumfile_found():
+            return False
+
+        self.log("checking for remote changes...")
+        os.system(
+            "rclone md5sum {} --checkfile {} > /dev/null 2> {}".format(
+                self.rclone_remote_dir, CHECKFILE, CACHEFILE
+            )
+        )
+
+        with open(CACHEFILE, mode="r", encoding="utf-8") as cachefile_reader:
+            cachefile_content = cachefile_reader.readlines()
+        for line in cachefile_content:
+            if re.search(": ([0-9])+ differences found$", line):
+                diffs = int(
+                    line[line.rfind(":") + 1 : line.find("differences")]
+                )
+                return not diffs
+        return True
+
+    def sort_by_starting_integer(self, filename):
+        try:
+            return int(filename.split(" ")[0])
+        except ValueError:
+            self.error_msg(
+                "Could not parse file, please number your files correctly"
+            )
+
+    def validate_template(self):
+        try:
+            with open(self.template, mode="r", encoding="utf-8") as reader:
+                content = reader.read()
+        except (FileNotFoundError, PermissionError):
+            self.error_msg("failed to access template file")
+
+        if not content.count(
+            "<!--BEGIN GENERATED CONTENT-->\n<!--END GENERATED CONTENT-->"
+        ):
+            self.error_msg("wrong template formatting")
+
+        self.log("template formatting validated")
+
+    def checksumfile_found(self):
+        return os.path.isfile(CHECKFILE)
+
+    def sync_with_remote(self):
+        self.log("syncing with remote...")
+        os.system(
+            "rclone sync {} {}".format(
+                self.rclone_remote_dir, self.rclone_local_dir
+            )
+        )
+
+    def save_new_checkfile(self):
+        self.log("saving new checkfile...")
+        os.system(
+            "rclone md5sum {} --output-file {}".format(
+                self.rclone_remote_dir, CHECKFILE
+            )
+        )
+
+    def create_button_html(self, path: str) -> str:
+        file_path = os.listdir(path)[0]
+        relative_path = os.path.join(
+            path[len(self.rclone_local_dir) + 1 :], file_path
+        ).replace("?", "%3F")
+        name = remove_index_from_filename(path[path.rfind("/") :])
+
+        self.log("generating html for button '{}'...".format(name))
+
+        if file_path == "url.txt":
+            with open(
+                os.path.join(path, file_path), mode="r", encoding="utf-8"
+            ) as reader:
+                content = reader.read()
+
+            relative_path = content.strip()
+
+        html = '<a class="button-a" href="{}">'.format(relative_path)
+        html += '<div class="button">{}</div></a>\n\n'.format(name)
+
+        return html
+
+    def create_summary_html(self, path: str) -> str:
+        self.log("generating html for a summary...")
+        html = "<details>\n<summary>{}</summary>\n<ul>".format(
+            remove_index_from_filename(path[path.rfind("/") :])
+        )
+        for filename in sorted(os.listdir(path)):
+            local_path = os.path.join(path, filename)
+            relative_path = local_path[len(self.rclone_local_dir) + 1 :]
+            html += '<li><a href="{}">{}</a></li</li>\n'.format(
+                relative_path.replace("?", "%3F"), filename
+            )
+        html += "</ul>\n</details>\n\n"
+
+        return html
+
+    def create_heading_html(self, filename: str) -> str:
+        self.log("generating html for a heading...")
+        html = "<h2>{}</h2>\n\n".format(remove_index_from_filename(filename))
+
+        return html
+
+    def contains_files(self, path: str) -> bool:
+        for file in os.scandir(path):
+            if not file.is_dir:
+                return True
+
+        return False
+
+    def handle_last_stage_html(self, path: str) -> str:
+        file_count = len(os.listdir(path))
+        if file_count == 0:
+            self.error_msg("can't have an empty directory")
+        elif file_count == 1:
+            return self.create_button_html(path)
+        else:
+            return self.create_summary_html(path)
+
+    def generate_html(self) -> str:
+        html = ""
+        self.log("generating html...")
+
+        for filename in sorted(
+            os.listdir(self.rclone_local_dir), key=self.sort_by_starting_integer
+        ):
+            file_path = os.path.join(self.rclone_local_dir, filename)
+            try:
+                if os.path.isfile(file_path) or os.path.islink(file_path):
+                    self.error_msg(
+                        "unexpected '{}', no files allowed at root".format(
+                            filename
+                        )
+                    )
+                elif os.path.isdir(file_path):
+                    self.log("parsing directory '{}'...".format(filename))
+                    depth = directory_depth(file_path)
+                    if depth == 0:
+                        html += self.handle_last_stage_html(file_path)
+                    elif depth == 1:
+                        html += self.create_heading_html(filename)
+                        for subdir_path in get_subdirs(file_path):
+                            html += self.handle_last_stage_html(subdir_path)
+                        if self.contains_files(file_path):
+                            self.error_msg(
+                                "a heading folder cannot contain files"
+                            )
+                    else:
+                        self.error_msg(
+                            "depth value '{}' is too high".format(depth)
+                        )
+
+            except (FileNotFoundError, PermissionError):
+                self.error_msg("could not access '{}'".format(file_path))
+
+        return html[:-2]
+
+    def insert_generated_html(self, html: str):
+        self.log(
+            "inserting generated html into '{}'...".format(self.target_file)
+        )
+        with open(self.template, mode="r", encoding="utf-8") as reader, open(
+            self.target_file, mode="w", encoding="utf-8"
+        ) as writer:
+            for line in reader:
+                writer.write(line)
+                if line == "<!--BEGIN GENERATED CONTENT-->\n":
+                    writer.write(html)
+
+    def push_changes(self):
+        self.log("pushing changes...")
+        os.system(
+            str(
+                "cd {}; git pull; git add .; ".format(self.target_repo)
+                + "git commit -m'automated bot commit';git push;"
+            )
+        )
+
+    def execute(self):
+        self.validate_template()
+        if self.no_changes_detected():
+            self.exit_early()
+        self.save_new_checkfile()
+        self.sync_with_remote()
+        self.insert_generated_html(self.generate_html())
+        self.push_changes()
+        self.success_message()
+
+
+def main():
+    colorama.init()
+
+    surf = Surf()
+    surf.execute()
+
+
+if __name__ == "__main__":
+    main()
